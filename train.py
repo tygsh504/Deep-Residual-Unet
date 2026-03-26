@@ -17,9 +17,11 @@ random.seed = seed
 np.random.seed = seed
 tf.seed = seed
 
+# Path
 dataset_path = "dataset/"
 train_path = os.path.join(dataset_path, "train/")
 
+# Data Generator
 class DataGen(keras.utils.Sequence):
     def __init__(self, ids, path, batch_size=8, image_size=128):
         self.ids = ids
@@ -72,7 +74,8 @@ class DataGen(keras.utils.Sequence):
     
     def __len__(self):
         return int(np.ceil(len(self.ids)/float(self.batch_size)))
-    
+
+# Hyperparameters
 train_csv = pd.read_csv(dataset_path + "train.csv")
 train_ids = train_csv["id"].values
 
@@ -84,19 +87,7 @@ val_data_size = 200
 valid_ids = train_ids[:val_data_size]
 train_ids = train_ids[val_data_size:]
 
-gen = DataGen(train_ids, train_path, batch_size=batch_size, image_size=image_size)
-x, y = gen.__getitem__(0)
-print(x.shape, y.shape)
-
-r = random.randint(0, len(x)-1)
-
-fig = plt.figure()
-fig.subplots_adjust(hspace=0.4, wspace=0.4)
-ax = fig.add_subplot(1, 2, 1)
-ax.imshow(x[r])
-ax = fig.add_subplot(1, 2, 2)
-ax.imshow(np.reshape(y[r]*255, (image_size, image_size)), cmap="gray")
-
+# Different Blocks
 def bn_act(x, act=True):
     x = keras.layers.BatchNormalization()(x)
     if act == True:
@@ -133,6 +124,7 @@ def upsample_concat_block(x, xskip):
     c = keras.layers.Concatenate()([u, xskip])
     return c
 
+# ResUNet
 def ResUNet():
     f = [16, 32, 64, 128, 256]
     inputs = keras.layers.Input((image_size, image_size, 3))
@@ -174,7 +166,6 @@ def dice_coef(y_true, y_pred):
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
     return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
-
 def dice_coef_loss(y_true, y_pred):
     return 1.0 - dice_coef(y_true, y_pred)
 
@@ -182,6 +173,11 @@ model = ResUNet()
 adam = keras.optimizers.Adam()
 model.compile(optimizer=adam, loss=dice_coef_loss, metrics=[dice_coef])
 model.summary()
+
+
+# ======================================================================
+# TRAINING SETUP WITH EXCEL SAVING, PLOTTING, AND CHECKPOINTS
+# ======================================================================
 
 train_gen = DataGen(train_ids, train_path, image_size=image_size, batch_size=batch_size)
 valid_gen = DataGen(valid_ids, train_path, image_size=image_size, batch_size=batch_size)
@@ -191,25 +187,71 @@ valid_steps = len(valid_ids)//batch_size
 
 epochs = 10
 
-model.fit_generator(train_gen, validation_data=valid_gen, steps_per_epoch=train_steps, validation_steps=valid_steps, 
-                    epochs=epochs)
+# 1. Create a ModelCheckpoint callback to save the best epoch
+checkpoint = keras.callbacks.ModelCheckpoint(
+    "ResUNet_best.h5",         
+    monitor="val_loss",        
+    verbose=1, 
+    save_best_only=True,       
+    save_weights_only=True,    
+    mode="min"                 
+)
 
-model.save_weights("ResUNet.h5")
+# 2. Capture the history object by assigning it to a variable
+history = model.fit_generator(
+    train_gen, 
+    validation_data=valid_gen, 
+    steps_per_epoch=train_steps, 
+    validation_steps=valid_steps, 
+    epochs=epochs,
+    callbacks=[checkpoint]
+)
 
-print("\n      Ground Truth            Predicted Value")
+# Save Last Weights
+model.save_weights("ResUNet_last.h5")
 
-for i in range(1, 5, 1):
-    ## Dataset for prediction
-    x, y = valid_gen.__getitem__(i)
-    result = model.predict(x)
-    result = result > 0.4
+# --- Post-Training: Save Excel and Plots ---
+# Extract metrics from Keras history
+hist_dict = history.history
+hist_dict['epoch'] = list(range(1, epochs + 1)) # Add epoch numbers for the X-axis
+
+# 3. Save to Excel
+df = pd.DataFrame(hist_dict)
+excel_path = 'training_metrics.xlsx'
+df.to_excel(excel_path, index=False)
+print(f'Metrics saved to {excel_path}')
+
+# 4. Plotting
+try:
+    plt.figure(figsize=(12, 5))
     
-    for i in range(len(result)):
-        fig = plt.figure()
-        fig.subplots_adjust(hspace=0.4, wspace=0.4)
+    # Plot 1: Training and Validation Loss
+    plt.subplot(1, 2, 1)
+    plt.plot(hist_dict['epoch'], hist_dict['loss'], label='Train Loss', color='blue')
+    plt.plot(hist_dict['epoch'], hist_dict['val_loss'], label='Val Loss', color='orange', linestyle='--')
+    plt.title('Loss over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss (Dice Loss)')
+    plt.legend()
+    plt.grid(True)
 
-        ax = fig.add_subplot(1, 2, 1)
-        ax.imshow(np.reshape(y[i]*255, (image_size, image_size)), cmap="gray")
+    # Plot 2: Training and Validation Dice Coefficient
+    # Keras names metrics dynamically based on the function name.
+    val_dice_key = 'val_dice_coef' if 'val_dice_coef' in hist_dict else 'val_dice'
+    dice_key = 'dice_coef' if 'dice_coef' in hist_dict else 'dice'
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(hist_dict['epoch'], hist_dict.get(val_dice_key, []), label='Val Dice', color='red')
+    plt.plot(hist_dict['epoch'], hist_dict.get(dice_key, []), label='Train Dice', color='pink', linestyle='--')
+    plt.title('Dice Coefficient over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Dice Coeff')
+    plt.legend()
+    plt.grid(True)
 
-        ax = fig.add_subplot(1, 2, 2)
-        ax.imshow(np.reshape(result[i]*255, (image_size, image_size)), cmap="gray")
+    plot_path = 'training_plot.jpg'
+    plt.savefig(plot_path)
+    plt.close()
+    print(f'Training plot saved to {plot_path}')
+except Exception as e:
+    print(f"Failed to save plots: {e}")
