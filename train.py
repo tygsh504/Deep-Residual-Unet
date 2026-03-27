@@ -17,6 +17,14 @@ np.random.seed(seed)
 tf.random.set_seed(seed)
 
 # ======================================================================
+# ENABLE MIXED PRECISION (For RTX 4060)
+# ======================================================================
+policy = keras.mixed_precision.Policy('mixed_float16')
+keras.mixed_precision.set_global_policy(policy)
+print("Compute dtype: %s" % policy.compute_dtype)
+print("Variable dtype: %s" % policy.variable_dtype)
+
+# ======================================================================
 # CONFIGURATION: DIRECTORIES & PATHS
 # ======================================================================
 train_dir = "dataset/train/"       # Path for Training Dataset
@@ -26,9 +34,11 @@ output_dir = "training_outputs/"   # Path to store weights, excel, and plots
 # Automatically create the output directory if it does not exist
 os.makedirs(output_dir, exist_ok=True)
 
-# Data Generator
+# ======================================================================
+# 1. DATA GENERATOR (With Advanced Augmentation)
+# ======================================================================
 class DataGen(keras.utils.Sequence):
-    def __init__(self, ids, path, batch_size=4, img_w=640, img_h=480):
+    def __init__(self, ids, path, batch_size=8, img_w=480, img_h=640):
         self.ids = ids
         self.path = path
         self.batch_size = batch_size
@@ -41,14 +51,33 @@ class DataGen(keras.utils.Sequence):
         image_path = os.path.join(self.path, "images", id_name) + ".png"
         mask_path = os.path.join(self.path, "masks", id_name) + ".png"
         
-        ## Reading Image
+        ## Reading Image & Mask
         image = cv2.imread(image_path)
         image = cv2.resize(image, (self.img_w, self.img_h))
         
-        ##Reading Mask
         mask = cv2.imread(mask_path, 0)
         mask = cv2.resize(mask, (self.img_w, self.img_h))
         mask = np.expand_dims(mask, axis=-1)
+        
+        # --- DATA AUGMENTATION ---
+        # 1. Geometric: 50% chance to flip horizontally
+        if random.random() > 0.5:
+            image = cv2.flip(image, 1)
+            mask = cv2.flip(mask, 1)
+            if len(mask.shape) == 2: mask = np.expand_dims(mask, axis=-1)
+                
+        # 2. Geometric: 50% chance to flip vertically
+        if random.random() > 0.5:
+            image = cv2.flip(image, 0)
+            mask = cv2.flip(mask, 0)
+            if len(mask.shape) == 2: mask = np.expand_dims(mask, axis=-1)
+            
+        # 3. Photometric: 50% chance to adjust brightness and contrast
+        if random.random() > 0.5:
+            alpha = random.uniform(0.7, 1.3) # Contrast control
+            beta = random.randint(-30, 30)   # Brightness control
+            image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+        # -------------------------
         
         ## Normalizing 
         image = image/255.0
@@ -70,8 +99,9 @@ class DataGen(keras.utils.Sequence):
             image.append(_img)
             mask.append(_mask)
             
-        image = np.array(image)
-        mask  = np.array(mask)
+        # Cast to float32 for Keras input (Mixed precision handles the FP16 conversion internally)
+        image = np.array(image, dtype=np.float32)
+        mask  = np.array(mask, dtype=np.float32)
         
         return image, mask
     
@@ -81,7 +111,9 @@ class DataGen(keras.utils.Sequence):
     def __len__(self):
         return int(np.ceil(len(self.ids)/float(self.batch_size)))
 
-# Different Blocks
+# ======================================================================
+# 2. MODEL ARCHITECTURE & BLOCKS
+# ======================================================================
 def bn_act(x, act=True):
     x = keras.layers.BatchNormalization()(x)
     if act == True:
@@ -93,18 +125,12 @@ def conv_block(x, filters, kernel_size=(3, 3), padding="same", strides=1):
     conv = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides)(conv)
     return conv
 
-def stem(x, filters, kernel_size=(3, 3), padding="same", strides=1):
-    conv = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides)(x)
-    conv = conv_block(conv, filters, kernel_size=kernel_size, padding=padding, strides=strides)
-    
-    shortcut = keras.layers.Conv2D(filters, kernel_size=(1, 1), padding=padding, strides=strides)(x)
-    shortcut = bn_act(shortcut, act=False)
-    
-    output = keras.layers.Add()([conv, shortcut])
-    return output
-
 def residual_block(x, filters, kernel_size=(3, 3), padding="same", strides=1):
     res = conv_block(x, filters, kernel_size=kernel_size, padding=padding, strides=strides)
+    
+    # Add 30% Dropout to prevent overfitting
+    res = keras.layers.Dropout(0.3)(res)
+    
     res = conv_block(res, filters, kernel_size=kernel_size, padding=padding, strides=1)
     
     shortcut = keras.layers.Conv2D(filters, kernel_size=(1, 1), padding=padding, strides=strides)(x)
@@ -122,11 +148,11 @@ def Pretrained_ResUNet(img_h, img_w):
     # 1. Input Layer
     inputs = keras.layers.Input((img_h, img_w, 3))
     
-    # 2. Load the Pre-trained ResNet50 Encoder (Fully Trainable)
+    # 2. Load the Pre-trained ResNet50 Encoder
     encoder = keras.applications.ResNet50(weights="imagenet", include_top=False, input_tensor=inputs)
     
     # 3. Extract Skip Connections from the pre-trained encoder
-    s1 = encoder.input            # Shape: (480, 640)
+    s1 = encoder.input                                   # Shape: (480, 640)
     s2 = encoder.get_layer("conv1_relu").output          # Shape: (240, 320)
     s3 = encoder.get_layer("conv2_block3_out").output    # Shape: (120, 160)
     s4 = encoder.get_layer("conv3_block4_out").output    # Shape: (60, 80)
@@ -134,7 +160,7 @@ def Pretrained_ResUNet(img_h, img_w):
     # 4. Bridge
     b1 = encoder.get_layer("conv4_block6_out").output    # Shape: (30, 40)
     
-    # 5. Decoder (Using your existing custom residual blocks)
+    # 5. Decoder (Using existing custom residual blocks)
     f = [16, 32, 64, 128, 256]
     
     u1 = upsample_concat_block(b1, s4)
@@ -149,19 +175,26 @@ def Pretrained_ResUNet(img_h, img_w):
     u4 = upsample_concat_block(d3, s1)
     d4 = residual_block(u4, f[0])
     
-    # Final classification layer
-    outputs = keras.layers.Conv2D(1, (1, 1), padding="same", activation="sigmoid")(d4)
+    # Final classification layer - MUST be dtype='float32' for numerical stability in mixed precision
+    outputs = keras.layers.Conv2D(1, (1, 1), padding="same", activation="sigmoid", dtype='float32')(d4)
     
     model = keras.models.Model(inputs, outputs)
     
     return model
 
-# Metrics and Loss
+# ======================================================================
+# 3. METRICS
+# ======================================================================
 smooth = 1.
 
 def dice_coef(y_true, y_pred):
     y_true_f = tf.reshape(y_true, [-1])
     y_pred_f = tf.reshape(y_pred, [-1])
+    
+    # Ensure float32 for metric calculation
+    y_true_f = tf.cast(y_true_f, tf.float32)
+    y_pred_f = tf.cast(y_pred_f, tf.float32)
+    
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
     return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
@@ -170,10 +203,10 @@ def dice_coef_loss(y_true, y_pred):
 
 
 # ======================================================================
-# TRAINING SETUP WITH TRANSFER LEARNING (SINGLE PHASE)
+# 4. TRAINING SETUP 
 # ======================================================================
 
-# Function to dynamically fetch IDs from a directory (Replaces CSV)
+# Function to dynamically fetch IDs from a directory
 def get_file_ids(directory):
     img_folder = os.path.join(directory, "images")
     if not os.path.exists(img_folder):
@@ -188,7 +221,7 @@ print(f"Found {len(train_ids)} training images and {len(valid_ids)} validation i
 # Hyperparameters
 img_w = 480
 img_h = 640
-batch_size = 4
+batch_size = 8    # Increased to 8 thanks to Mixed Precision!
 epochs = 100
 
 train_gen = DataGen(train_ids, train_dir, img_w=img_w, img_h=img_h, batch_size=batch_size)
@@ -203,7 +236,7 @@ model = Pretrained_ResUNet(img_h, img_w)
 # 2. Compile with a lower learning rate (1e-4) to protect the pre-trained weights
 model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4), loss=dice_coef_loss, metrics=[dice_coef])
 
-# 3. Callbacks (Configured to save to output_dir)
+# 3. Callbacks
 checkpoint = keras.callbacks.ModelCheckpoint(
     os.path.join(output_dir, "ResUNet_best.h5"), 
     monitor="val_loss", 
@@ -214,7 +247,14 @@ checkpoint = keras.callbacks.ModelCheckpoint(
 )
 
 reduce_lr = keras.callbacks.ReduceLROnPlateau(
-    monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1
+    monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=1
+)
+
+early_stop = keras.callbacks.EarlyStopping(
+    monitor="val_loss", 
+    patience=10, 
+    restore_best_weights=True, 
+    verbose=1
 )
 
 # 4. Train the entire network end-to-end
@@ -224,18 +264,20 @@ history = model.fit(
     steps_per_epoch=train_steps, 
     validation_steps=valid_steps, 
     epochs=epochs, 
-    callbacks=[checkpoint, reduce_lr]
+    callbacks=[checkpoint, reduce_lr, early_stop]
 )
 
-# Save Last Weights to output_dir
+# Save Last Weights
 model.save_weights(os.path.join(output_dir, "ResUNet_last.h5"))
 
-# --- Post-Training: Save Excel and Plots ---
+# ======================================================================
+# 5. POST-TRAINING: EXCEL & PLOTS
+# ======================================================================
 # Extract metrics from Keras history
 hist_dict = history.history
 hist_dict['epoch'] = list(range(1, len(hist_dict['loss']) + 1)) 
 
-# Save to Excel in output_dir
+# Save to Excel
 df = pd.DataFrame(hist_dict)
 excel_path = os.path.join(output_dir, 'training_metrics.xlsx')
 df.to_excel(excel_path, index=False)

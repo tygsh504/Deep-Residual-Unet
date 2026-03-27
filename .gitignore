@@ -1,3 +1,5 @@
 /venv
 /dataset
 *.h5
+/training_outputs
+/training_results
