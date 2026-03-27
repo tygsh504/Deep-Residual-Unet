@@ -35,15 +35,16 @@ output_dir = "training_outputs/"   # Path to store weights, excel, and plots
 os.makedirs(output_dir, exist_ok=True)
 
 # ======================================================================
-# 1. DATA GENERATOR (With Advanced Augmentation)
+# 1. DATA GENERATOR (With Enhanced Augmentation)
 # ======================================================================
 class DataGen(keras.utils.Sequence):
-    def __init__(self, ids, path, batch_size=8, img_w=480, img_h=640):
+    def __init__(self, ids, path, batch_size=8, img_w=480, img_h=640, augment=True):
         self.ids = ids
         self.path = path
         self.batch_size = batch_size
         self.img_w = img_w
         self.img_h = img_h
+        self.augment = augment
         self.on_epoch_end()
         
     def __load__(self, id_name):
@@ -60,24 +61,49 @@ class DataGen(keras.utils.Sequence):
         mask = np.expand_dims(mask, axis=-1)
         
         # --- DATA AUGMENTATION ---
-        # 1. Geometric: 50% chance to flip horizontally
-        if random.random() > 0.5:
-            image = cv2.flip(image, 1)
-            mask = cv2.flip(mask, 1)
-            if len(mask.shape) == 2: mask = np.expand_dims(mask, axis=-1)
+        if self.augment:
+            # 1. Geometric: 50% chance to flip horizontally
+            if random.random() > 0.5:
+                image = cv2.flip(image, 1)
+                mask = cv2.flip(mask, 1)
                 
-        # 2. Geometric: 50% chance to flip vertically
-        if random.random() > 0.5:
-            image = cv2.flip(image, 0)
-            mask = cv2.flip(mask, 0)
-            if len(mask.shape) == 2: mask = np.expand_dims(mask, axis=-1)
-            
-        # 3. Photometric: 50% chance to adjust brightness and contrast
-        if random.random() > 0.5:
-            alpha = random.uniform(0.7, 1.3) # Contrast control
-            beta = random.randint(-30, 30)   # Brightness control
-            image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+            # 2. Geometric: 50% chance to flip vertically
+            if random.random() > 0.5:
+                image = cv2.flip(image, 0)
+                mask = cv2.flip(mask, 0)
+                
+            # 3. Rotation: 50% chance to rotate between -30 and 30 degrees
+            if random.random() > 0.5:
+                angle = random.randint(-30, 30)
+                M = cv2.getRotationMatrix2D((self.img_w / 2, self.img_h / 2), angle, 1.0)
+                image = cv2.warpAffine(image, M, (self.img_w, self.img_h))
+                mask = cv2.warpAffine(mask, M, (self.img_w, self.img_h))
+                
+            # 4. Zoom: 50% chance to zoom in slightly
+            if random.random() > 0.5:
+                zoom = random.uniform(1.0, 1.2)
+                h, w = image.shape[:2]
+                new_h, new_w = int(h * zoom), int(w * zoom)
+                
+                # Resize
+                image = cv2.resize(image, (new_w, new_h))
+                mask = cv2.resize(mask, (new_w, new_h))
+                
+                # Crop back to original dimensions
+                start_h = (new_h - h) // 2
+                start_w = (new_w - w) // 2
+                image = image[start_h:start_h + h, start_w:start_w + w]
+                mask = mask[start_h:start_h + h, start_w:start_w + w]
+
+            # 5. Photometric: 50% chance to adjust brightness and contrast
+            if random.random() > 0.5:
+                alpha = random.uniform(0.7, 1.3) # Contrast control
+                beta = random.randint(-30, 30)   # Brightness control
+                image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
         # -------------------------
+        
+        # Re-apply dimensions for mask if lost during augmentation
+        if len(mask.shape) == 2: mask = np.expand_dims(mask, axis=-1)
         
         ## Normalizing 
         image = image/255.0
@@ -99,7 +125,7 @@ class DataGen(keras.utils.Sequence):
             image.append(_img)
             mask.append(_mask)
             
-        # Cast to float32 for Keras input (Mixed precision handles the FP16 conversion internally)
+        # Cast to float32 for Keras input 
         image = np.array(image, dtype=np.float32)
         mask  = np.array(mask, dtype=np.float32)
         
@@ -128,8 +154,8 @@ def conv_block(x, filters, kernel_size=(3, 3), padding="same", strides=1):
 def residual_block(x, filters, kernel_size=(3, 3), padding="same", strides=1):
     res = conv_block(x, filters, kernel_size=kernel_size, padding=padding, strides=strides)
     
-    # Add 30% Dropout to prevent overfitting
-    res = keras.layers.Dropout(0.3)(res)
+    # Increased to 50% Dropout to strongly prevent overfitting
+    res = keras.layers.Dropout(0.5)(res)
     
     res = conv_block(res, filters, kernel_size=kernel_size, padding=padding, strides=1)
     
@@ -221,11 +247,12 @@ print(f"Found {len(train_ids)} training images and {len(valid_ids)} validation i
 # Hyperparameters
 img_w = 480
 img_h = 640
-batch_size = 8    # Increased to 8 thanks to Mixed Precision!
+batch_size = 8    
 epochs = 100
 
-train_gen = DataGen(train_ids, train_dir, img_w=img_w, img_h=img_h, batch_size=batch_size)
-valid_gen = DataGen(valid_ids, val_dir, img_w=img_w, img_h=img_h, batch_size=batch_size)
+# Apply augmentation only to training data
+train_gen = DataGen(train_ids, train_dir, img_w=img_w, img_h=img_h, batch_size=batch_size, augment=True)
+valid_gen = DataGen(valid_ids, val_dir, img_w=img_w, img_h=img_h, batch_size=batch_size, augment=False)
 
 train_steps = len(train_ids) // batch_size
 valid_steps = len(valid_ids) // batch_size
@@ -233,8 +260,8 @@ valid_steps = len(valid_ids) // batch_size
 # 1. Initialize Model
 model = Pretrained_ResUNet(img_h, img_w)
 
-# 2. Compile with a lower learning rate (1e-4) to protect the pre-trained weights
-model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4), loss=dice_coef_loss, metrics=[dice_coef])
+# 2. Compile with an even lower learning rate (5e-5) to protect pre-trained weights
+model.compile(optimizer=keras.optimizers.Adam(learning_rate=5e-5), loss=dice_coef_loss, metrics=[dice_coef])
 
 # 3. Callbacks
 checkpoint = keras.callbacks.ModelCheckpoint(
@@ -247,15 +274,15 @@ checkpoint = keras.callbacks.ModelCheckpoint(
 )
 
 reduce_lr = keras.callbacks.ReduceLROnPlateau(
-    monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=1
+    monitor="val_loss", factor=0.5, patience=6, min_lr=1e-7, verbose=1
 )
 
-early_stop = keras.callbacks.EarlyStopping(
-    monitor="val_loss", 
-    patience=10, 
-    restore_best_weights=True, 
-    verbose=1
-)
+# early_stop = keras.callbacks.EarlyStopping(
+#     monitor="val_loss", 
+#     patience=15, 
+#     restore_best_weights=True, 
+#     verbose=1
+# )
 
 # 4. Train the entire network end-to-end
 history = model.fit(
@@ -264,7 +291,8 @@ history = model.fit(
     steps_per_epoch=train_steps, 
     validation_steps=valid_steps, 
     epochs=epochs, 
-    callbacks=[checkpoint, reduce_lr, early_stop]
+    # callbacks=[checkpoint, reduce_lr, early_stop]
+    callbacks=[checkpoint, reduce_lr]
 )
 
 # Save Last Weights

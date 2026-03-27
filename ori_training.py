@@ -13,9 +13,9 @@ from tensorflow import keras
 
 ## Seeding 
 seed = 2019
-random.seed = seed
-np.random.seed = seed
-tf.seed = seed
+random.seed(seed)
+np.random.seed(seed)
+tf.random.set_seed(seed)
 
 
 # Path
@@ -81,10 +81,10 @@ class DataGen(keras.utils.Sequence):
 train_csv = pd.read_csv(dataset_path + "train.csv")
 train_ids = train_csv["id"].values
 
-image_size = 128
-batch_size = 16
+image_size = 480
+batch_size = 4
 
-val_data_size = 200
+val_data_size = 818
 
 valid_ids = train_ids[:val_data_size]
 train_ids = train_ids[val_data_size:]
@@ -178,8 +178,8 @@ def ResUNet():
 smooth = 1.
 
 def dice_coef(y_true, y_pred):
-    y_true_f = tf.layers.flatten(y_true)
-    y_pred_f = tf.layers.flatten(y_pred)
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
     return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
@@ -201,8 +201,8 @@ valid_steps = len(valid_ids)//batch_size
 
 epochs = 10
 
-model.fit_generator(train_gen, validation_data=valid_gen, steps_per_epoch=train_steps, validation_steps=valid_steps, 
-                    epochs=epochs)
+model.fit(train_gen, validation_data=valid_gen, steps_per_epoch=train_steps, validation_steps=valid_steps, 
+          epochs=epochs)
 
 model.save_weights("ResUNet.h5")
 
