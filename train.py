@@ -1,6 +1,5 @@
 ## Imports
 import os
-import sys
 import random
 
 import numpy as np
@@ -13,9 +12,9 @@ from tensorflow import keras
 
 ## Seeding 
 seed = 2019
-random.seed = seed
-np.random.seed = seed
-tf.seed = seed
+random.seed(seed)
+np.random.seed(seed)
+tf.random.set_seed(seed) # Updated for TensorFlow 2.x compatibility
 
 # Path
 dataset_path = "dataset/"
@@ -23,11 +22,12 @@ train_path = os.path.join(dataset_path, "train/")
 
 # Data Generator
 class DataGen(keras.utils.Sequence):
-    def __init__(self, ids, path, batch_size=8, image_size=128):
+    def __init__(self, ids, path, batch_size=4, img_w=640, img_h=480):
         self.ids = ids
         self.path = path
         self.batch_size = batch_size
-        self.image_size = image_size
+        self.img_w = img_w
+        self.img_h = img_h
         self.on_epoch_end()
         
     def __load__(self, id_name):
@@ -37,14 +37,14 @@ class DataGen(keras.utils.Sequence):
         
         ## Reading Image
         image = cv2.imread(image_path)
-        image = cv2.resize(image, (self.image_size, self.image_size))
+        image = cv2.resize(image, (self.img_w, self.img_h))
         
         ##Reading Mask
         mask = cv2.imread(mask_path, 0)
-        mask = cv2.resize(mask, (self.image_size, self.image_size))
+        mask = cv2.resize(mask, (self.img_w, self.img_h))
         mask = np.expand_dims(mask, axis=-1)
         
-        ## Normalizaing 
+        ## Normalizing 
         image = image/255.0
         mask = mask/255.0
         
@@ -75,14 +75,19 @@ class DataGen(keras.utils.Sequence):
     def __len__(self):
         return int(np.ceil(len(self.ids)/float(self.batch_size)))
 
+
 # Hyperparameters
 train_csv = pd.read_csv(dataset_path + "train.csv")
 train_ids = train_csv["id"].values
 
-image_size = 128
-batch_size = 16
+# Updated for your dataset
+img_w = 480
+img_h = 640
+batch_size = 4
 
-val_data_size = 200
+# NOTE: Make sure your train.csv has MORE than 200 images total. 
+# If your dataset is smaller, reduce val_data_size to something like 20.
+val_data_size = 818 
 
 valid_ids = train_ids[:val_data_size]
 train_ids = train_ids[val_data_size:]
@@ -127,7 +132,9 @@ def upsample_concat_block(x, xskip):
 # ResUNet
 def ResUNet():
     f = [16, 32, 64, 128, 256]
-    inputs = keras.layers.Input((image_size, image_size, 3))
+    
+    # Input layer updated for rectangular images
+    inputs = keras.layers.Input((img_h, img_w, 3))
     
     ## Encoder
     e0 = inputs
@@ -158,18 +165,23 @@ def ResUNet():
     model = keras.models.Model(inputs, outputs)
     return model
 
+
+# Metrics and Loss Functions (Updated for modern TF 2.x)
 smooth = 1.
 
 def dice_coef(y_true, y_pred):
-    y_true_f = tf.layers.flatten(y_true)
-    y_pred_f = tf.layers.flatten(y_pred)
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
     return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
 def dice_coef_loss(y_true, y_pred):
     return 1.0 - dice_coef(y_true, y_pred)
 
+
+# Initialize and Compile Model
 model = ResUNet()
+# adam = keras.optimizers.Adam(learning_rate=1e-4)
 adam = keras.optimizers.Adam()
 model.compile(optimizer=adam, loss=dice_coef_loss, metrics=[dice_coef])
 model.summary()
@@ -179,13 +191,13 @@ model.summary()
 # TRAINING SETUP WITH EXCEL SAVING, PLOTTING, AND CHECKPOINTS
 # ======================================================================
 
-train_gen = DataGen(train_ids, train_path, image_size=image_size, batch_size=batch_size)
-valid_gen = DataGen(valid_ids, train_path, image_size=image_size, batch_size=batch_size)
+train_gen = DataGen(train_ids, train_path, img_w=img_w, img_h=img_h, batch_size=batch_size)
+valid_gen = DataGen(valid_ids, train_path, img_w=img_w, img_h=img_h, batch_size=batch_size)
 
 train_steps = len(train_ids)//batch_size
 valid_steps = len(valid_ids)//batch_size
 
-epochs = 10
+epochs = 100
 
 # 1. Create a ModelCheckpoint callback to save the best epoch
 checkpoint = keras.callbacks.ModelCheckpoint(
@@ -198,7 +210,8 @@ checkpoint = keras.callbacks.ModelCheckpoint(
 )
 
 # 2. Capture the history object by assigning it to a variable
-history = model.fit_generator(
+# Using model.fit instead of model.fit_generator to avoid deprecation warnings
+history = model.fit(
     train_gen, 
     validation_data=valid_gen, 
     steps_per_epoch=train_steps, 
@@ -216,8 +229,12 @@ hist_dict = history.history
 hist_dict['epoch'] = list(range(1, epochs + 1)) # Add epoch numbers for the X-axis
 
 # 3. Save to Excel
+excel_dir = os.path.dirname(excel_path)
+if not os.path.exists(excel_dir):
+    os.makedirs(excel_dir)
+
 df = pd.DataFrame(hist_dict)
-excel_path = 'training_metrics.xlsx'
+excel_path = 'training_results/training_metrics.xlsx'
 df.to_excel(excel_path, index=False)
 print(f'Metrics saved to {excel_path}')
 
@@ -236,7 +253,6 @@ try:
     plt.grid(True)
 
     # Plot 2: Training and Validation Dice Coefficient
-    # Keras names metrics dynamically based on the function name.
     val_dice_key = 'val_dice_coef' if 'val_dice_coef' in hist_dict else 'val_dice'
     dice_key = 'dice_coef' if 'dice_coef' in hist_dict else 'dice'
     
@@ -249,7 +265,11 @@ try:
     plt.legend()
     plt.grid(True)
 
-    plot_path = 'training_plot.jpg'
+    plot_dir = os.path.dirname(plot_path)
+    if not os.path.exists(plot_dir):
+        os.makedirs(plot_dir)
+
+    plot_path = 'training_results/training_plot.jpg'
     plt.savefig(plot_path)
     plt.close()
     print(f'Training plot saved to {plot_path}')
