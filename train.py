@@ -209,15 +209,24 @@ checkpoint = keras.callbacks.ModelCheckpoint(
     mode="min"                 
 )
 
-# 2. Capture the history object by assigning it to a variable
-# Using model.fit instead of model.fit_generator to avoid deprecation warnings
+# --- NEW: 2. Create the Learning Rate Scheduler ---
+reduce_lr = keras.callbacks.ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.1,      # Reduce the learning rate by 10x
+    patience=5,      # Wait 5 epochs of no improvement before reducing
+    min_lr=1e-6,     # Don't let the learning rate go below this
+    verbose=1
+)
+
+# 3. Capture the history object
 history = model.fit(
     train_gen, 
     validation_data=valid_gen, 
     steps_per_epoch=train_steps, 
     validation_steps=valid_steps, 
-    epochs=epochs,
-    callbacks=[checkpoint]
+    epochs=100,  # Ensure this is set high (e.g., 100)
+    # --- Add the new reduce_lr to the callbacks list here ---
+    callbacks=[checkpoint, reduce_lr] 
 )
 
 # Save Last Weights
