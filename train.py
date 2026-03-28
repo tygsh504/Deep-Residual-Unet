@@ -397,7 +397,7 @@ output_dir = "training_outputs/"   # Path to store weights, excel, and plots
 os.makedirs(output_dir, exist_ok=True)
 
 # ======================================================================
-# 1. DATA GENERATOR (With Overlapping Crop & Patch)
+# 1. DATA GENERATOR (With Random Crop & Patch)
 # ======================================================================
 class DataGen(keras.utils.Sequence):
     def __init__(self, ids, path, batch_size=4, orig_w=640, orig_h=480, patch_size=256, augment=True):
@@ -475,17 +475,22 @@ class DataGen(keras.utils.Sequence):
         
         return image, mask
 
-    def get_overlapping_patches(self, array):
-        """Extracts 12 overlapping 256x256 patches from a 480x640 array."""
-        patches = []
-        y_starts = [0, 112, 224]  # 480 height coverage
-        x_starts = [0, 128, 256, 384] # 640 width coverage
+    def get_random_patches(self, img_array, mask_array, num_patches=4):
+        """Extracts 4 random 256x256 patches from the arrays to prevent OOM."""
+        img_patches = []
+        mask_patches = []
         
-        for y in y_starts:
-            for x in x_starts:
-                patch = array[y:y+self.patch_size, x:x+self.patch_size]
-                patches.append(patch)
-        return patches
+        max_y = img_array.shape[0] - self.patch_size
+        max_x = img_array.shape[1] - self.patch_size
+        
+        for _ in range(num_patches):
+            y = random.randint(0, max_y)
+            x = random.randint(0, max_x)
+            
+            img_patches.append(img_array[y:y+self.patch_size, x:x+self.patch_size])
+            mask_patches.append(mask_array[y:y+self.patch_size, x:x+self.patch_size])
+            
+        return img_patches, mask_patches
     
     def __getitem__(self, index):
         files_batch = self.ids[index*self.batch_size : (index+1)*self.batch_size]
@@ -496,9 +501,8 @@ class DataGen(keras.utils.Sequence):
         for id_name in files_batch:
             _img, _mask = self.__load__(id_name)
             
-            # Extract 12 patches from the loaded image
-            img_patches = self.get_overlapping_patches(_img)
-            mask_patches = self.get_overlapping_patches(_mask)
+            # Extract 4 random patches per image
+            img_patches, mask_patches = self.get_random_patches(_img, _mask)
             
             image_batch.extend(img_patches)
             mask_batch.extend(mask_patches)
@@ -615,7 +619,7 @@ print(f"Found {len(train_ids)} training images and {len(valid_ids)} validation i
 orig_w = 640
 orig_h = 480
 patch_size = 256
-batch_size = 2 # Kept low because 1 image = 12 patches (True Batch Size = 48)  
+batch_size = 4 
 epochs = 100
 
 train_gen = DataGen(train_ids, train_dir, orig_w=orig_w, orig_h=orig_h, patch_size=patch_size, batch_size=batch_size, augment=True)
@@ -644,6 +648,13 @@ reduce_lr = keras.callbacks.ReduceLROnPlateau(
     monitor="val_loss", factor=0.5, patience=6, min_lr=1e-7, verbose=1
 )
 
+early_stopping = keras.callbacks.EarlyStopping(
+    monitor="val_loss",
+    patience=15,               
+    restore_best_weights=True, 
+    verbose=1
+)
+
 # 4. Train
 history = model.fit(
     train_gen, 
@@ -651,7 +662,7 @@ history = model.fit(
     steps_per_epoch=train_steps, 
     validation_steps=valid_steps, 
     epochs=epochs, 
-    callbacks=[checkpoint, reduce_lr]
+    callbacks=[checkpoint, reduce_lr, early_stopping]
 )
 
 # Save Last Weights

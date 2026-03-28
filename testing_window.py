@@ -24,7 +24,9 @@ MAIN_OUTPUT_DIR = r"C:\Users\User\Desktop\ResUNet_Test_Results_4"
 # The 7 disease folders
 DISEASES = ["Bacterial Leaf Blight", "Bacterial Leaf Streak", "Blast", "Brown Spot", "DownyMildew", "Hispa", "Tungro"]
 
-INPUT_SHAPE = [640, 480] # [Height, Width]
+# FIX: Aligned with train.py orig_h=480, orig_w=640
+INPUT_SHAPE = [480, 640] # [Height, Width] 
+PATCH_SIZE = 256 # Matching the patch size from training
 # ----------------------------------
 
 # ==========================================
@@ -122,7 +124,6 @@ def save_visual_result(image_plot, true_np, pred_np, filename, dice_score, outpu
 
     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
     
-    # image_plot is already an RGB image scaled between 0 and 1
     ax[0].imshow(image_plot); ax[0].set_title(f"Original: {filename}"); ax[0].axis("off")
     ax[1].imshow(true_bin, cmap='gray'); ax[1].set_title("Ground Truth"); ax[1].axis("off")
     ax[2].imshow(pred_bin, cmap='gray'); ax[2].set_title(f"Pred (Dice: {dice_score:.2f})"); ax[2].axis("off")
@@ -132,7 +133,37 @@ def save_visual_result(image_plot, true_np, pred_np, filename, dice_score, outpu
     plt.close(fig)
 
 # ==========================================
-# 3. TESTING LOGIC
+# 3. SLIDING WINDOW INFERENCE LOGIC
+# ==========================================
+def sliding_window_inference(image, model, patch_size=(256, 256), stride=128):
+    """Predicts a large image seamlessly using patches to match training dimensions."""
+    img_h, img_w, _ = image.shape
+    patch_h, patch_w = patch_size
+    
+    prob_map = np.zeros((img_h, img_w, 1), dtype=np.float32)
+    count_map = np.zeros((img_h, img_w, 1), dtype=np.float32)
+    
+    for y in range(0, img_h - patch_h + stride, stride):
+        for x in range(0, img_w - patch_w + stride, stride):
+            y_start = min(y, img_h - patch_h)
+            x_start = min(x, img_w - patch_w)
+            y_end = y_start + patch_h
+            x_end = x_start + patch_w
+            
+            patch = image[y_start:y_end, x_start:x_end, :]
+            patch_input = np.expand_dims(patch, axis=0)
+            
+            patch_pred = model.predict(patch_input, verbose=0)[0]
+            
+            prob_map[y_start:y_end, x_start:x_end] += patch_pred
+            count_map[y_start:y_end, x_start:x_end] += 1
+
+    final_prob_map = prob_map / count_map
+    return final_prob_map[:, :, 0] # Return as 2D array
+
+
+# ==========================================
+# 4. TESTING LOGIC
 # ==========================================
 def run_test_on_disease(disease_name, net, params, flops):
     img_dir = os.path.join(BASE_DATA_PATH, disease_name, "Infer_Ori")
@@ -156,7 +187,6 @@ def run_test_on_disease(disease_name, net, params, flops):
     for filename in tqdm(image_files, desc=f"Testing {disease_name}"):
         img_path = os.path.join(img_dir, filename)
         
-        # Check matching mask name
         mask_name = filename if os.path.exists(os.path.join(mask_dir, filename)) else os.path.splitext(filename)[0] + '.png'
         mask_path = os.path.join(mask_dir, mask_name)
 
@@ -164,32 +194,23 @@ def run_test_on_disease(disease_name, net, params, flops):
             logging.warning(f"Missing mask for {filename}, skipping.")
             continue
 
-        # --- FIX: Match train.py preprocessing exactly ---
         image_bgr = cv2.imread(img_path)
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        image_resized = cv2.resize(image_rgb, (img_w, img_h)) # OpenCV takes (Width, Height)
+        image_resized = cv2.resize(image_rgb, (img_w, img_h)) 
         
-        # 1. Keep a cleanly formatted RGB copy for Matplotlib (0-1 scaled)
         image_plot = image_resized / 255.0
         
-        # 2. Apply strict ImageNet preprocessing for the model
         image_norm = np.array(image_resized, dtype=np.float32)
         image_norm = keras.applications.resnet50.preprocess_input(image_norm)
-        # -------------------------------------------------
         
-        # Load and preprocess Mask
         mask = cv2.imread(mask_path, 0)
         mask = cv2.resize(mask, (img_w, img_h))
-        mask_norm = (mask > 0).astype(np.float32) # Binarize
+        mask_norm = (mask > 0).astype(np.float32) 
 
-        # Add batch dimension for prediction: (1, 640, 480, 3)
-        input_tensor = np.expand_dims(image_norm, axis=0)
+        # --- FIX: Replaced direct prediction with sliding window inference ---
+        pred_mask = sliding_window_inference(image_norm, net, patch_size=(PATCH_SIZE, PATCH_SIZE), stride=128)
+        # ---------------------------------------------------------------------
 
-        # Predict
-        pred = net.predict(input_tensor, verbose=0)
-        pred_mask = pred[0, :, :, 0] # Remove batch and channel dims
-
-        # Calculate metrics and save
         metrics = calculate_metrics(pred_mask, mask_norm)
         metrics['Filename'] = filename
         results.append(metrics)
@@ -214,12 +235,11 @@ def run_test_on_disease(disease_name, net, params, flops):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-    # 1. Instantiate the Model Architecture
     try:
         logging.info("Building Deep Residual UNet architecture...")
-        net = Pretrained_ResUNet(img_h=INPUT_SHAPE[0], img_w=INPUT_SHAPE[1])
+        # FIX: Instantiate the network using the dimensions of the patches it was trained on
+        net = Pretrained_ResUNet(img_h=PATCH_SIZE, img_w=PATCH_SIZE)
         
-        # 2. Load the trained weights
         logging.info(f"Loading weights from {MODEL_PATH}...")
         net.load_weights(MODEL_PATH)
         logging.info("Model loaded successfully.")
@@ -240,18 +260,14 @@ if __name__ == '__main__':
     if all_disease_results:
         overall_df = pd.DataFrame(all_disease_results)
         
-        # Move 'Disease' column to the front
         cols = ['Disease'] + [c for c in overall_df.columns if c != 'Disease']
         overall_df = overall_df[cols]
         
-        # Calculate overall mean across all diseases
         mean_row = overall_df.mean(numeric_only=True).to_dict()
         mean_row['Disease'] = 'OVERALL_MEAN'
         
-        # Append the calculated overall mean to the dataframe
         overall_df = pd.concat([overall_df, pd.DataFrame([mean_row])], ignore_index=True)
         
-        # Save to the main output directory
         mean_output_path = Path(MAIN_OUTPUT_DIR) / 'calculated_mean.xlsx'
         overall_df.to_excel(mean_output_path, index=False)
         logging.info(f"Overall means saved to {mean_output_path}")
