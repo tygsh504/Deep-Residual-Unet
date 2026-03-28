@@ -10,10 +10,16 @@ from pathlib import Path
 import tensorflow as tf
 from tensorflow import keras
 
+# ======================================================================
+# ENABLE MIXED PRECISION (Must match train.py)
+# ======================================================================
+policy = keras.mixed_precision.Policy('mixed_float16')
+keras.mixed_precision.set_global_policy(policy)
+
 # --- USER CONFIGURATION SECTION ---
-MODEL_PATH = 'ResUNet_best.h5' 
+MODEL_PATH = 'training_outputs/ResUNet_best.h5' 
 BASE_DATA_PATH = r"C:\Users\User\Desktop\Paddy_Dataset"
-MAIN_OUTPUT_DIR = r"C:\Users\User\Desktop\ResUNet_Test_Results"
+MAIN_OUTPUT_DIR = r"C:\Users\User\Desktop\ResUNet_Test_Results_2"
 
 # The 7 disease folders
 DISEASES = ["Bacterial Leaf Blight", "Bacterial Leaf Streak", "Blast", "Brown Spot", "DownyMildew", "Hispa", "Tungro"]
@@ -22,7 +28,7 @@ INPUT_SHAPE = [640, 480] # [Height, Width]
 # ----------------------------------
 
 # ==========================================
-# 1. DEEP RESIDUAL UNET ARCHITECTURE
+# 1. DEEP RESIDUAL UNET ARCHITECTURE (Matched with train.py)
 # ==========================================
 def bn_act(x, act=True):
     x = keras.layers.BatchNormalization()(x)
@@ -35,18 +41,9 @@ def conv_block(x, filters, kernel_size=(3, 3), padding="same", strides=1):
     conv = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides)(conv)
     return conv
 
-def stem(x, filters, kernel_size=(3, 3), padding="same", strides=1):
-    conv = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides)(x)
-    conv = conv_block(conv, filters, kernel_size=kernel_size, padding=padding, strides=strides)
-    
-    shortcut = keras.layers.Conv2D(filters, kernel_size=(1, 1), padding=padding, strides=strides)(x)
-    shortcut = bn_act(shortcut, act=False)
-    
-    output = keras.layers.Add()([conv, shortcut])
-    return output
-
 def residual_block(x, filters, kernel_size=(3, 3), padding="same", strides=1):
     res = conv_block(x, filters, kernel_size=kernel_size, padding=padding, strides=strides)
+    res = keras.layers.Dropout(0.5)(res)
     res = conv_block(res, filters, kernel_size=kernel_size, padding=padding, strides=1)
     
     shortcut = keras.layers.Conv2D(filters, kernel_size=(1, 1), padding=padding, strides=strides)(x)
@@ -60,36 +57,34 @@ def upsample_concat_block(x, xskip):
     c = keras.layers.Concatenate()([u, xskip])
     return c
 
-def ResUNet(img_h, img_w):
-    f = [16, 32, 64, 128, 256]
+def Pretrained_ResUNet(img_h, img_w):
     inputs = keras.layers.Input((img_h, img_w, 3))
     
-    ## Encoder
-    e0 = inputs
-    e1 = stem(e0, f[0])
-    e2 = residual_block(e1, f[1], strides=2)
-    e3 = residual_block(e2, f[2], strides=2)
-    e4 = residual_block(e3, f[3], strides=2)
-    e5 = residual_block(e4, f[4], strides=2)
+    encoder = keras.applications.ResNet50(weights=None, include_top=False, input_tensor=inputs)
     
-    ## Bridge
-    b0 = conv_block(e5, f[4], strides=1)
-    b1 = conv_block(b0, f[4], strides=1)
+    s1 = encoder.input                                   
+    s2 = encoder.get_layer("conv1_relu").output          
+    s3 = encoder.get_layer("conv2_block3_out").output    
+    s4 = encoder.get_layer("conv3_block4_out").output    
     
-    ## Decoder
-    u1 = upsample_concat_block(b1, e4)
-    d1 = residual_block(u1, f[4])
+    b1 = encoder.get_layer("conv4_block6_out").output    
     
-    u2 = upsample_concat_block(d1, e3)
-    d2 = residual_block(u2, f[3])
+    f = [16, 32, 64, 128, 256]
     
-    u3 = upsample_concat_block(d2, e2)
-    d3 = residual_block(u3, f[2])
+    u1 = upsample_concat_block(b1, s4)
+    d1 = residual_block(u1, f[3])
     
-    u4 = upsample_concat_block(d3, e1)
-    d4 = residual_block(u4, f[1])
+    u2 = upsample_concat_block(d1, s3)
+    d2 = residual_block(u2, f[2])
     
-    outputs = keras.layers.Conv2D(1, (1, 1), padding="same", activation="sigmoid")(d4)
+    u3 = upsample_concat_block(d2, s2)
+    d3 = residual_block(u3, f[1])
+    
+    u4 = upsample_concat_block(d3, s1)
+    d4 = residual_block(u4, f[0])
+    
+    outputs = keras.layers.Conv2D(1, (1, 1), padding="same", activation="sigmoid", dtype='float32')(d4)
+    
     model = keras.models.Model(inputs, outputs)
     return model
 
@@ -99,8 +94,6 @@ def ResUNet(img_h, img_w):
 def calculate_complexity(model):
     """Calculates model complexity."""
     params = model.count_params()
-    # FLOPs calculation in TF2 is highly complex and often requires graph freezing.
-    # We return 0 here to match the fallback behavior of the original PyTorch script.
     flops = 0 
     return params, flops
 
@@ -123,16 +116,14 @@ def calculate_metrics(pred_np, true_np):
 
     return {"Dice": dice, "IoU": iou, "Precision": precision, "Recall": recall, "Accuracy": accuracy, "F1_Score": f1}
 
-def save_visual_result(image_np, true_np, pred_np, filename, dice_score, output_dir):
-    # Denormalize image for plotting
-    img_plot = (image_np * 255).astype(np.uint8)
-    
+def save_visual_result(image_plot, true_np, pred_np, filename, dice_score, output_dir):
     true_bin = (true_np > 0.5).astype(np.uint8)
     pred_bin = (pred_np > 0.5).astype(np.uint8)
 
     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-    # Convert BGR (OpenCV) to RGB for Matplotlib
-    ax[0].imshow(cv2.cvtColor(img_plot, cv2.COLOR_BGR2RGB)); ax[0].set_title(f"Original: {filename}"); ax[0].axis("off")
+    
+    # image_plot is already an RGB image scaled between 0 and 1
+    ax[0].imshow(image_plot); ax[0].set_title(f"Original: {filename}"); ax[0].axis("off")
     ax[1].imshow(true_bin, cmap='gray'); ax[1].set_title("Ground Truth"); ax[1].axis("off")
     ax[2].imshow(pred_bin, cmap='gray'); ax[2].set_title(f"Pred (Dice: {dice_score:.2f})"); ax[2].axis("off")
 
@@ -173,10 +164,18 @@ def run_test_on_disease(disease_name, net, params, flops):
             logging.warning(f"Missing mask for {filename}, skipping.")
             continue
 
-        # Load and preprocess Image
-        image = cv2.imread(img_path)
-        image = cv2.resize(image, (img_w, img_h)) # OpenCV takes (Width, Height)
-        image_norm = image / 255.0
+        # --- FIX: Match train.py preprocessing exactly ---
+        image_bgr = cv2.imread(img_path)
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image_resized = cv2.resize(image_rgb, (img_w, img_h)) # OpenCV takes (Width, Height)
+        
+        # 1. Keep a cleanly formatted RGB copy for Matplotlib (0-1 scaled)
+        image_plot = image_resized / 255.0
+        
+        # 2. Apply strict ImageNet preprocessing for the model
+        image_norm = np.array(image_resized, dtype=np.float32)
+        image_norm = keras.applications.resnet50.preprocess_input(image_norm)
+        # -------------------------------------------------
         
         # Load and preprocess Mask
         mask = cv2.imread(mask_path, 0)
@@ -195,7 +194,7 @@ def run_test_on_disease(disease_name, net, params, flops):
         metrics['Filename'] = filename
         results.append(metrics)
         
-        save_visual_result(image_norm, mask_norm, pred_mask, filename, metrics['Dice'], img_output_dir)
+        save_visual_result(image_plot, mask_norm, pred_mask, filename, metrics['Dice'], img_output_dir)
 
     if results:
         df = pd.DataFrame(results)
@@ -218,7 +217,7 @@ if __name__ == '__main__':
     # 1. Instantiate the Model Architecture
     try:
         logging.info("Building Deep Residual UNet architecture...")
-        net = ResUNet(img_h=INPUT_SHAPE[0], img_w=INPUT_SHAPE[1])
+        net = Pretrained_ResUNet(img_h=INPUT_SHAPE[0], img_w=INPUT_SHAPE[1])
         
         # 2. Load the trained weights
         logging.info(f"Loading weights from {MODEL_PATH}...")

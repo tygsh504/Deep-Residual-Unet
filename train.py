@@ -38,7 +38,7 @@ os.makedirs(output_dir, exist_ok=True)
 # 1. DATA GENERATOR (With Enhanced Augmentation)
 # ======================================================================
 class DataGen(keras.utils.Sequence):
-    def __init__(self, ids, path, batch_size=8, img_w=480, img_h=640, augment=True):
+    def __init__(self, ids, path, batch_size=8, img_w=512, img_h=512, augment=True):
         self.ids = ids
         self.path = path
         self.batch_size = batch_size
@@ -48,12 +48,21 @@ class DataGen(keras.utils.Sequence):
         self.on_epoch_end()
         
     def __load__(self, id_name):
-        ## Path
-        image_path = os.path.join(self.path, "images", id_name) + ".png"
+        ## Path (Dynamically check for file extension to prevent crashes)
+        img_base = os.path.join(self.path, "images", id_name)
+        if os.path.exists(img_base + ".png"):
+            image_path = img_base + ".png"
+        elif os.path.exists(img_base + ".jpg"):
+            image_path = img_base + ".jpg"
+        else:
+            image_path = img_base + ".jpeg"
+            
         mask_path = os.path.join(self.path, "masks", id_name) + ".png"
         
         ## Reading Image & Mask
         image = cv2.imread(image_path)
+        # FIX: Convert OpenCV's default BGR to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = cv2.resize(image, (self.img_w, self.img_h))
         
         mask = cv2.imread(mask_path, 0)
@@ -105,16 +114,17 @@ class DataGen(keras.utils.Sequence):
         # Re-apply dimensions for mask if lost during augmentation
         if len(mask.shape) == 2: mask = np.expand_dims(mask, axis=-1)
         
-        ## Normalizing 
-        image = image/255.0
-        mask = mask/255.0
+        ## FIX: Correct Normalization for Pre-trained ResNet50
+        image = np.array(image, dtype=np.float32)
+        image = keras.applications.resnet50.preprocess_input(image)
+        
+        # Mask needs to be 0-1 for Sigmoid output
+        mask = mask / 255.0
         
         return image, mask
     
     def __getitem__(self, index):
-        if(index+1)*self.batch_size > len(self.ids):
-            self.batch_size = len(self.ids) - index*self.batch_size
-        
+        # FIX: Removed the self-destructing batch size logic that was causing iteration drops
         files_batch = self.ids[index*self.batch_size : (index+1)*self.batch_size]
         
         image = []
@@ -132,7 +142,9 @@ class DataGen(keras.utils.Sequence):
         return image, mask
     
     def on_epoch_end(self):
-        pass
+        # FIX: Shuffle the dataset after every epoch to prevent sequence memorization
+        if self.augment:
+            random.shuffle(self.ids)
     
     def __len__(self):
         return int(np.ceil(len(self.ids)/float(self.batch_size)))
@@ -178,13 +190,13 @@ def Pretrained_ResUNet(img_h, img_w):
     encoder = keras.applications.ResNet50(weights="imagenet", include_top=False, input_tensor=inputs)
     
     # 3. Extract Skip Connections from the pre-trained encoder
-    s1 = encoder.input                                   # Shape: (480, 640)
-    s2 = encoder.get_layer("conv1_relu").output          # Shape: (240, 320)
-    s3 = encoder.get_layer("conv2_block3_out").output    # Shape: (120, 160)
-    s4 = encoder.get_layer("conv3_block4_out").output    # Shape: (60, 80)
+    s1 = encoder.input                                   
+    s2 = encoder.get_layer("conv1_relu").output          
+    s3 = encoder.get_layer("conv2_block3_out").output    
+    s4 = encoder.get_layer("conv3_block4_out").output    
     
     # 4. Bridge
-    b1 = encoder.get_layer("conv4_block6_out").output    # Shape: (30, 40)
+    b1 = encoder.get_layer("conv4_block6_out").output    
     
     # 5. Decoder (Using existing custom residual blocks)
     f = [16, 32, 64, 128, 256]
@@ -244,13 +256,13 @@ train_ids = get_file_ids(train_dir)
 valid_ids = get_file_ids(val_dir)
 print(f"Found {len(train_ids)} training images and {len(valid_ids)} validation images.")
 
-# Hyperparameters
+# Set standard U-Net compatible dimensions
 img_w = 480
 img_h = 640
 batch_size = 8    
 epochs = 100
 
-# Apply augmentation only to training data
+# FIX: Set augment=True for the training generator
 train_gen = DataGen(train_ids, train_dir, img_w=img_w, img_h=img_h, batch_size=batch_size, augment=True)
 valid_gen = DataGen(valid_ids, val_dir, img_w=img_w, img_h=img_h, batch_size=batch_size, augment=False)
 
@@ -277,13 +289,6 @@ reduce_lr = keras.callbacks.ReduceLROnPlateau(
     monitor="val_loss", factor=0.5, patience=6, min_lr=1e-7, verbose=1
 )
 
-# early_stop = keras.callbacks.EarlyStopping(
-#     monitor="val_loss", 
-#     patience=15, 
-#     restore_best_weights=True, 
-#     verbose=1
-# )
-
 # 4. Train the entire network end-to-end
 history = model.fit(
     train_gen, 
@@ -291,7 +296,6 @@ history = model.fit(
     steps_per_epoch=train_steps, 
     validation_steps=valid_steps, 
     epochs=epochs, 
-    # callbacks=[checkpoint, reduce_lr, early_stop]
     callbacks=[checkpoint, reduce_lr]
 )
 
@@ -313,10 +317,10 @@ print(f'Metrics saved to {excel_path}')
 
 # Plotting
 try:
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(18, 5))
     
     # Plot 1: Training and Validation Loss
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.plot(hist_dict['epoch'], hist_dict['loss'], label='Train Loss', color='blue')
     plt.plot(hist_dict['epoch'], hist_dict['val_loss'], label='Val Loss', color='orange', linestyle='--')
     plt.title('Loss over Epochs')
@@ -329,7 +333,7 @@ try:
     val_dice_key = 'val_dice_coef' if 'val_dice_coef' in hist_dict else 'val_dice'
     dice_key = 'dice_coef' if 'dice_coef' in hist_dict else 'dice'
     
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.plot(hist_dict['epoch'], hist_dict.get(val_dice_key, []), label='Val Dice', color='red')
     plt.plot(hist_dict['epoch'], hist_dict.get(dice_key, []), label='Train Dice', color='pink', linestyle='--')
     plt.title('Dice Coefficient over Epochs')
@@ -338,6 +342,17 @@ try:
     plt.legend()
     plt.grid(True)
 
+    # Plot 3: Learning Rate
+    if 'lr' in hist_dict:
+        plt.subplot(1, 3, 3)
+        plt.plot(hist_dict['epoch'], hist_dict['lr'], label='Learning Rate', color='green')
+        plt.title('Learning Rate over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.legend()
+        plt.grid(True)
+
+    plt.tight_layout()
     plot_path = os.path.join(output_dir, 'training_plot.jpg')
     plt.savefig(plot_path)
     plt.close()
